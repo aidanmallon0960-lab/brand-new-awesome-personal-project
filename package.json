@@ -1,0 +1,11 @@
+{
+  "name": "sky-sprint",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Sky Sprint multiplayer platformer server",
+  "main": "app.js",
+  "scripts": {
+    "build": "node --check app.js",
+    "start": "node app.js"
+  }
+}
