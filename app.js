@@ -2,12 +2,14 @@ const http = require("http");
 const { URL } = require("url");
 
 const HOST = "0.0.0.0";
-const PORT = 8000;
+const PORT = Number(process.env.PORT) || 8000;
 const TICK_RATE = 30;
 const FRAME_TIME_MS = 1000 / TICK_RATE;
 const WORLD_WIDTH = 420;
 const VIEW_HEIGHT = 720;
-const TARGET_HEIGHT = 5500;
+const DEFAULT_TARGET_HEIGHT = 5500;
+const MIN_TARGET_HEIGHT = 1500;
+const MAX_TARGET_HEIGHT = 15000;
 const ROOM_TIMEOUT_MS = 60 * 30 * 1000;
 const COLORS = ["#ffcf56", "#72f1b8"];
 
@@ -206,6 +208,8 @@ const HTML_PAGE = `<!DOCTYPE html>
       </div>
 
       <div class="controls">
+        <input id="nameInput" maxlength="16" placeholder="Your player name">
+        <input id="goalInput" type="number" min="1500" max="15000" step="500" value="5500" placeholder="Finish line in meters">
         <button id="soloPlay">Solo Run</button>
         <button id="createRoom">Create Room</button>
         <input id="roomInput" maxlength="4" placeholder="Enter room code">
@@ -219,7 +223,8 @@ const HTML_PAGE = `<!DOCTYPE html>
       <div class="help">
         Move with <strong>A / D</strong> or <strong>Left / Right</strong>.<br>
         On mobile, use the on-screen buttons.<br>
-        Solo mode uses the same course too, so you can practice before racing.
+        Pick your own name and finish line before starting.<br>
+        Look out for boost pads and fragile ledges on the climb.
       </div>
     </aside>
 
@@ -243,6 +248,9 @@ const HTML_PAGE = `<!DOCTYPE html>
     const statusBox = document.getElementById("statusBox");
     const roomLabel = document.getElementById("roomLabel");
     const playerLabel = document.getElementById("playerLabel");
+    const goalLabel = document.getElementById("goalLabel");
+    const nameInput = document.getElementById("nameInput");
+    const goalInput = document.getElementById("goalInput");
 
     const state = {
       roomCode: null,
@@ -252,6 +260,11 @@ const HTML_PAGE = `<!DOCTYPE html>
       keys: { left: false, right: false },
       pollHandle: null,
       inputHandle: null,
+      renderHandle: null,
+      polling: false,
+      sendingInput: false,
+      lastSentSignature: "",
+      lastInputSentAt: 0,
     };
 
     function setStatus(message, isDanger = false) {
@@ -272,13 +285,36 @@ const HTML_PAGE = `<!DOCTYPE html>
       return data;
     }
 
+    function getPlayerName() {
+      const name = nameInput.value.trim();
+      return name || "Player";
+    }
+
+    function getGoalValue() {
+      const parsed = Number(goalInput.value);
+      if (!Number.isFinite(parsed)) return 5500;
+      return Math.max(1500, Math.min(15000, Math.round(parsed / 500) * 500));
+    }
+
+    function syncGoalInput(value) {
+      goalInput.value = value;
+      goalLabel.textContent = \`Finish line: \${Number(value).toLocaleString()}m\`;
+    }
+
     async function createRoom() {
-      const data = await api("/api/create_room", {}, "POST");
+      const data = await api("/api/create_room", {
+        player_name: getPlayerName(),
+        target_height: getGoalValue()
+      }, "POST");
       attachPlayer(data, true);
     }
 
     async function startSolo() {
-      const data = await api("/api/create_room", { mode: "singleplayer" }, "POST");
+      const data = await api("/api/create_room", {
+        mode: "singleplayer",
+        player_name: getPlayerName(),
+        target_height: getGoalValue()
+      }, "POST");
       attachPlayer(data, true);
     }
 
@@ -288,7 +324,10 @@ const HTML_PAGE = `<!DOCTYPE html>
         setStatus("Enter a room code first.", true);
         return;
       }
-      const data = await api("/api/join_room", { room_code: roomCode }, "POST");
+      const data = await api("/api/join_room", {
+        room_code: roomCode,
+        player_name: getPlayerName()
+      }, "POST");
       attachPlayer(data, false);
     }
 
@@ -298,6 +337,7 @@ const HTML_PAGE = `<!DOCTYPE html>
       state.connected = true;
       roomLabel.textContent = \`Room: \${data.room_code}\`;
       playerLabel.textContent = \`You: \${data.player_name}\`;
+      syncGoalInput(data.target_height);
       if (data.mode === "singleplayer") {
         setStatus(\`Solo run <span class="room-line">\${data.room_code}</span> is live. Reach the summit on your own pace.\`);
       } else {
@@ -313,28 +353,39 @@ const HTML_PAGE = `<!DOCTYPE html>
     function startLoops() {
       stopLoops();
       pollState();
-      state.pollHandle = setInterval(pollState, 120);
-      state.inputHandle = setInterval(sendInput, 70);
+      state.pollHandle = setInterval(pollState, 90);
+      state.inputHandle = setInterval(() => sendInput(false), 120);
+      renderLoop();
     }
 
     function stopLoops() {
       if (state.pollHandle) clearInterval(state.pollHandle);
       if (state.inputHandle) clearInterval(state.inputHandle);
+      if (state.renderHandle) cancelAnimationFrame(state.renderHandle);
     }
 
     async function pollState() {
-      if (!state.connected) return;
+      if (!state.connected || state.polling) return;
+      state.polling = true;
       try {
         const data = await api(\`/api/state?room_code=\${state.roomCode}&player_id=\${state.playerId}\`);
         state.snapshot = data;
-        render();
+        syncGoalInput(data.target_height);
       } catch (error) {
         setStatus(error.message, true);
+      } finally {
+        state.polling = false;
       }
     }
 
-    async function sendInput() {
-      if (!state.connected) return;
+    async function sendInput(force) {
+      if (!state.connected || state.sendingInput) return;
+      const signature = \`\${state.keys.left ? 1 : 0}:\${state.keys.right ? 1 : 0}\`;
+      const now = Date.now();
+      if (!force && signature === state.lastSentSignature && now - state.lastInputSentAt < 250) {
+        return;
+      }
+      state.sendingInput = true;
       try {
         await api("/api/input", {
           room_code: state.roomCode,
@@ -342,9 +393,18 @@ const HTML_PAGE = `<!DOCTYPE html>
           left: state.keys.left,
           right: state.keys.right
         }, "POST");
+        state.lastSentSignature = signature;
+        state.lastInputSentAt = now;
       } catch (error) {
         setStatus(error.message, true);
+      } finally {
+        state.sendingInput = false;
       }
+    }
+
+    function renderLoop() {
+      render();
+      state.renderHandle = requestAnimationFrame(renderLoop);
     }
 
     function worldToScreen(x, y, cameraY) {
@@ -397,7 +457,22 @@ const HTML_PAGE = `<!DOCTYPE html>
       snapshot.platforms.forEach((platform) => {
         if (platform.y < cameraY - 40 || platform.y > cameraY + canvas.height + 40) return;
         const pos = worldToScreen(platform.x, platform.y, cameraY);
-        drawRoundedRect(pos.x, pos.y - 10, platform.width, 10, 8, "#2a9d8f");
+        if (platform.type === "boost") {
+          drawRoundedRect(pos.x, pos.y - 12, platform.width, 12, 8, "#e76f51");
+          ctx.fillStyle = "rgba(255,255,255,0.8)";
+          ctx.fillRect(pos.x + 10, pos.y - 8, Math.max(12, platform.width - 20), 2);
+        } else if (platform.type === "fragile") {
+          drawRoundedRect(pos.x, pos.y - 10, platform.width, 10, 8, platform.active ? "#8d99ae" : "rgba(141,153,174,0.35)");
+          if (platform.active) {
+            ctx.strokeStyle = "rgba(19, 42, 19, 0.25)";
+            ctx.beginPath();
+            ctx.moveTo(pos.x + 10, pos.y - 9);
+            ctx.lineTo(pos.x + platform.width - 10, pos.y - 3);
+            ctx.stroke();
+          }
+        } else {
+          drawRoundedRect(pos.x, pos.y - 10, platform.width, 10, 8, "#2a9d8f");
+        }
       });
 
       snapshot.players.forEach((player) => {
@@ -438,8 +513,18 @@ const HTML_PAGE = `<!DOCTYPE html>
     }
 
     function setKey(key, pressed) {
-      if (key === "ArrowLeft" || key === "a" || key === "A") state.keys.left = pressed;
-      if (key === "ArrowRight" || key === "d" || key === "D") state.keys.right = pressed;
+      let changed = false;
+      if (key === "ArrowLeft" || key === "a" || key === "A") {
+        changed = state.keys.left !== pressed;
+        state.keys.left = pressed;
+      }
+      if (key === "ArrowRight" || key === "d" || key === "D") {
+        changed = state.keys.right !== pressed || changed;
+        state.keys.right = pressed;
+      }
+      if (changed) {
+        sendInput(true);
+      }
     }
 
     window.addEventListener("keydown", (event) => setKey(event.key, true));
@@ -447,8 +532,18 @@ const HTML_PAGE = `<!DOCTYPE html>
 
     function bindHoldButton(id, key) {
       const element = document.getElementById(id);
-      const on = () => { state.keys[key] = true; };
-      const off = () => { state.keys[key] = false; };
+      const on = () => {
+        if (!state.keys[key]) {
+          state.keys[key] = true;
+          sendInput(true);
+        }
+      };
+      const off = () => {
+        if (state.keys[key]) {
+          state.keys[key] = false;
+          sendInput(true);
+        }
+      };
       ["pointerdown", "touchstart"].forEach((name) => element.addEventListener(name, on));
       ["pointerup", "pointerleave", "touchend", "touchcancel"].forEach((name) => element.addEventListener(name, off));
     }
@@ -480,6 +575,7 @@ const HTML_PAGE = `<!DOCTYPE html>
       }
     });
 
+    syncGoalInput(5500);
     render();
   </script>
 </body>
@@ -493,6 +589,23 @@ function generateCode(length = 4) {
     result += alphabet[Math.floor(Math.random() * alphabet.length)];
   }
   return result;
+}
+
+function sanitizePlayerName(value, fallback = "Player") {
+  const trimmed = String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 16);
+  return trimmed || fallback;
+}
+
+function normalizeTargetHeight(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return DEFAULT_TARGET_HEIGHT;
+  }
+  const stepped = Math.round(parsed / 500) * 500;
+  return Math.max(MIN_TARGET_HEIGHT, Math.min(MAX_TARGET_HEIGHT, stepped));
 }
 
 function createPlayer({ id, name, x, color }) {
@@ -515,10 +628,11 @@ function createPlayer({ id, name, x, color }) {
 }
 
 class Room {
-  constructor(code, seed, mode = "multiplayer") {
+  constructor(code, seed, mode = "multiplayer", targetHeight = DEFAULT_TARGET_HEIGHT) {
     this.code = code;
     this.seed = seed;
     this.mode = mode;
+    this.targetHeight = targetHeight;
     this.players = new Map();
     this.platforms = [];
     this.started = mode === "singleplayer";
@@ -533,7 +647,7 @@ class Room {
       mode: this.mode,
       started: this.started,
       winner_name: winner ? winner.name : null,
-      target_height: TARGET_HEIGHT,
+      target_height: this.targetHeight,
       players: Array.from(this.players.values(), (player) => ({
         id: player.id,
         name: player.name,
@@ -545,7 +659,13 @@ class Room {
         active: player.active,
         color: player.color,
       })),
-      platforms: this.platforms,
+      platforms: this.platforms.map((platform) => ({
+        x: platform.x,
+        y: platform.y,
+        width: platform.width,
+        type: platform.type,
+        active: platform.active,
+      })),
     };
   }
 }
@@ -570,21 +690,23 @@ class GameState {
     this.rooms = new Map();
   }
 
-  createRoom(mode = "multiplayer") {
+  createRoom({ mode = "multiplayer", playerName, targetHeight } = {}) {
     let code = generateCode();
     while (this.rooms.has(code)) {
       code = generateCode();
     }
 
-    const room = new Room(code, Math.floor(Math.random() * 1_000_001), mode);
-    room.platforms = this.generatePlatforms(room.seed);
+    const normalizedTargetHeight = normalizeTargetHeight(targetHeight);
+    const room = new Room(code, Math.floor(Math.random() * 1_000_001), mode, normalizedTargetHeight);
+    room.platforms = this.generatePlatforms(room.seed, room.targetHeight);
 
     const playerId = generateCode(8);
+    const initialName = sanitizePlayerName(playerName, mode === "multiplayer" ? "Player 1" : "Solo");
     room.players.set(
       playerId,
       createPlayer({
         id: playerId,
-        name: mode === "multiplayer" ? "Player 1" : "Solo",
+        name: initialName,
         x: 110,
         color: COLORS[0],
       })
@@ -594,7 +716,7 @@ class GameState {
     return { roomCode: code, playerId };
   }
 
-  joinRoom(code) {
+  joinRoom(code, playerName) {
     const room = this.requireRoom(code);
     if (room.mode !== "multiplayer") {
       throw new Error("That room is not accepting multiplayer joins.");
@@ -608,7 +730,7 @@ class GameState {
       playerId,
       createPlayer({
         id: playerId,
-        name: "Player 2",
+        name: sanitizePlayerName(playerName, "Player 2"),
         x: 260,
         color: COLORS[1],
       })
@@ -641,12 +763,19 @@ class GameState {
         continue;
       }
       if (room.started && !room.winnerId) {
-        this.updateRoom(room);
+        this.updateRoom(room, now);
       }
     }
   }
 
-  updateRoom(room) {
+  updateRoom(room, now) {
+    for (const platform of room.platforms) {
+      if (!platform.active && platform.respawnAt && now >= platform.respawnAt) {
+        platform.active = true;
+        platform.respawnAt = 0;
+      }
+    }
+
     for (const player of room.players.values()) {
       let accel = 0;
       if (player.left) accel -= 1;
@@ -663,13 +792,20 @@ class GameState {
 
       if (player.vy <= 0) {
         for (const platform of room.platforms) {
+          if (!platform.active) {
+            continue;
+          }
           const withinX =
             player.x + player.width > platform.x &&
             player.x < platform.x + platform.width;
           const crossingY = previousY >= platform.y && platform.y >= player.y - 6;
           if (withinX && crossingY) {
             player.y = platform.y + 2;
-            player.vy = 12.4;
+            player.vy = platform.type === "boost" ? 15.6 : 12.4;
+            if (platform.type === "fragile") {
+              platform.active = false;
+              platform.respawnAt = now + 2200;
+            }
             break;
           }
         }
@@ -683,21 +819,28 @@ class GameState {
       }
 
       player.progress = Math.max(player.progress, player.y);
-      if (player.progress >= TARGET_HEIGHT) {
+      if (player.progress >= room.targetHeight) {
         room.winnerId = player.id;
       }
     }
   }
 
-  generatePlatforms(seed) {
+  generatePlatforms(seed, targetHeight) {
     const rng = new Random(seed);
-    const platforms = [{ x: 20, y: 90, width: 380 }];
+    const platforms = [{ x: 20, y: 90, width: 380, type: "standard", active: true, respawnAt: 0 }];
     let y = 180;
 
-    while (y <= TARGET_HEIGHT + VIEW_HEIGHT) {
+    while (y <= targetHeight + VIEW_HEIGHT) {
       const width = rng.randint(72, 108);
       const x = rng.randint(16, WORLD_WIDTH - width - 16);
-      platforms.push({ x, y, width });
+      let type = "standard";
+      const roll = rng.next();
+      if (roll > 0.8) {
+        type = "boost";
+      } else if (roll > 0.62) {
+        type = "fragile";
+      }
+      platforms.push({ x, y, width, type, active: true, respawnAt: 0 });
       y += rng.randint(72, 108);
     }
 
@@ -801,13 +944,20 @@ const server = http.createServer(async (req, res) => {
       try {
         if (url.pathname === "/api/create_room") {
           const mode = data.mode || "multiplayer";
-          const { roomCode, playerId } = state.createRoom(mode);
+          const { roomCode, playerId } = state.createRoom({
+            mode,
+            playerName: data.player_name,
+            targetHeight: data.target_height,
+          });
+          const room = state.requireRoom(roomCode);
+          const player = state.requirePlayer(room, playerId);
           sendJson(
             res,
             {
               room_code: roomCode,
               player_id: playerId,
-              player_name: mode === "multiplayer" ? "Player 1" : "Solo",
+              player_name: player.name,
+              target_height: room.targetHeight,
               mode,
             },
             201
@@ -817,13 +967,16 @@ const server = http.createServer(async (req, res) => {
 
         if (url.pathname === "/api/join_room") {
           const roomCode = (data.room_code || "").toUpperCase();
-          const { roomCode: joinedRoomCode, playerId } = state.joinRoom(roomCode);
+          const { roomCode: joinedRoomCode, playerId } = state.joinRoom(roomCode, data.player_name);
+          const room = state.requireRoom(joinedRoomCode);
+          const player = state.requirePlayer(room, playerId);
           sendJson(
             res,
             {
               room_code: joinedRoomCode,
               player_id: playerId,
-              player_name: "Player 2",
+              player_name: player.name,
+              target_height: room.targetHeight,
               mode: "multiplayer",
             },
             201
